@@ -127,8 +127,8 @@ def convert_input_pca_regression(request_body, request_content_type):
 
         SP500_1 = 'IBM_CR_Cum'
         IBM_CR_Cum = json.loads(request_body)[SP500_1]
-        SP500_2 = 'NVDA_CR_Cum'
-        NVDA_CR_Cum = json.loads(request_body)[SP500_2]
+        SP500_2 = 'MSFT_CR_Cum'
+        MSFT_CR_Cum = json.loads(request_body)[SP500_2]
 
         X = np.log(dataset.drop([target],axis=1)).diff(return_period)
         X = np.exp(X).cumsum()
