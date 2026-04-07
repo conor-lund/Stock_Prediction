@@ -95,7 +95,7 @@ def convert_input_pca_regression(request_body, request_content_type):
 
     dataset = pd.read_csv(file_path,index_col=0)
 
-    target = 'MSFT'
+    target = 'NVDA'
 
     option = 2
 
