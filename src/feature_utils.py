@@ -117,8 +117,8 @@ def convert_input_pca_regression(request_body, request_content_type):
         closest_index = distances.idxmin()
         closest_row = X.loc[[closest_index]]
     
-        closest_row[techIndicator_1] = RSI_15
-        closest_row[techIndicator_2] = MOM_15
+        closest_row[techIndicator_1] = kernelpca1
+        closest_row[techIndicator_2] = kernelpca2
     
         return closest_row
     else:
