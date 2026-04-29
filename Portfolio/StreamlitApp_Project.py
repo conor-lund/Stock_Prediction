@@ -46,14 +46,20 @@ from joblib import load
 warnings.simplefilter("ignore")
 
 # Fix path for Streamlit Cloud (ensure 'src' is findable)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..'))
+# Repo layout:
+#   <repo_root>/
+#       src/                         <- Custom_Classes.py, feature_utils.py
+#       Portfolio/
+#           StreamlitApp_Project.py  <- this file
+#           requirements.txt
+current_dir = os.path.dirname(os.path.abspath(__file__))         # .../Portfolio
+project_root = os.path.abspath(os.path.join(current_dir, '..'))  # .../<repo_root>
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# Make sure the local src/ folder is also importable so that the custom
-# transformer classes can be unpickled from the joblib pipeline.
-local_src = os.path.join(current_dir, 'src')
+# src/ is a SIBLING of Portfolio/, so it lives at <repo_root>/src — make sure
+# the unpickler can find LoanColumnCleaner / LoanFeatureEngineer / etc.
+local_src = os.path.join(project_root, 'src')
 if local_src not in sys.path:
     sys.path.append(local_src)
 
