@@ -1,79 +1,273 @@
-import pandas as pd
+"""
+Custom transformer classes for the LendingClub Loan Classification project.
+
+These classes are designed to be used inside a scikit-learn / imblearn Pipeline
+so that all data cleaning and feature engineering happens within the pipeline
+itself (no data leakage). The same Pipeline is later persisted with joblib,
+uploaded to S3, and deployed behind a SageMaker endpoint.
+"""
+
 import numpy as np
-import statsmodels.api as sm
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import PowerTransformer
+import pandas as pd
 from scipy.stats import skew
 
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.preprocessing import PowerTransformer
+
+
+# ---------------------------------------------------------------------------
+# 1. Loan-specific cleaning transformers
+# ---------------------------------------------------------------------------
+
+class LoanColumnCleaner(BaseEstimator, TransformerMixin):
+    """
+    Cleans LendingClub raw columns whose strings need to be coerced into
+    numeric values (term, emp_length, percentages, dates).
+
+    Each transformation is a separate "step" conceptually, but they are
+    grouped here for clarity and to keep the pipeline tidy.
+    """
+
+    def __init__(self,
+                 term_col='term',
+                 emp_length_col='emp_length',
+                 percent_cols=('int_rate', 'revol_util'),
+                 date_cols=('issue_d', 'earliest_cr_line')):
+        # NOTE: sklearn.clone() requires that every __init__ parameter is
+        # stored as an attribute with the EXACT SAME value (no list() casts,
+        # no copies, no transformations).  We do the iteration-friendly
+        # conversion lazily inside transform() instead.
+        self.term_col = term_col
+        self.emp_length_col = emp_length_col
+        self.percent_cols = percent_cols
+        self.date_cols = date_cols
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+
+        # Term: " 36 months" -> 36
+        if self.term_col in X.columns:
+            X[self.term_col] = (
+                X[self.term_col].astype(str)
+                                .str.replace('months', '', regex=False)
+                                .str.strip()
+            )
+            X[self.term_col] = pd.to_numeric(X[self.term_col], errors='coerce')
+
+        # Employment length: "10+ years" -> 10, "< 1 year" -> 0
+        if self.emp_length_col in X.columns:
+            s = (X[self.emp_length_col].astype(str)
+                                       .str.replace('10+ years', '10', regex=False)
+                                       .str.replace('< 1 year', '0', regex=False))
+            X[self.emp_length_col] = pd.to_numeric(s.str.split().str[0],
+                                                   errors='coerce')
+
+        # Percent strings: "13.99%" -> 13.99
+        for col in list(self.percent_cols or []):
+            if col in X.columns:
+                X[col] = (X[col].astype(str)
+                                .str.replace('%', '', regex=False)
+                                .str.strip())
+                X[col] = pd.to_numeric(X[col], errors='coerce')
+
+        # Date strings like "Dec-2015" -> year as integer (and keep month index)
+        for col in list(self.date_cols or []):
+            if col in X.columns:
+                dt = pd.to_datetime(X[col], format='%b-%Y', errors='coerce')
+                X[col + '_year'] = dt.dt.year
+                X[col + '_month'] = dt.dt.month
+                X = X.drop(columns=[col])
+
+        return X
+
+
+class HighMissingDropper(BaseEstimator, TransformerMixin):
+    """Drop columns with a missing-value ratio above the threshold."""
+
+    def __init__(self, threshold=0.4):
+        self.threshold = threshold
+        self.cols_to_keep_ = []
+
+    def fit(self, X, y=None):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        ratios = X.isnull().mean()
+        self.cols_to_keep_ = ratios[ratios <= self.threshold].index.tolist()
+        return self
+
+    def transform(self, X):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        keep = [c for c in self.cols_to_keep_ if c in X.columns]
+        return X[keep]
+
+
+class LowVarianceDropper(BaseEstimator, TransformerMixin):
+    """Drop columns where the mode accounts for >= dominance_threshold of values."""
+
+    def __init__(self, dominance_threshold=0.95):
+        self.dominance_threshold = dominance_threshold
+        self.cols_to_keep_ = []
+
+    def fit(self, X, y=None):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        keep = []
+        for col in X.columns:
+            top_freq = X[col].value_counts(dropna=False, normalize=True).iloc[0] \
+                if X[col].notna().any() else 1.0
+            if top_freq < self.dominance_threshold:
+                keep.append(col)
+        self.cols_to_keep_ = keep
+        return self
+
+    def transform(self, X):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        keep = [c for c in self.cols_to_keep_ if c in X.columns]
+        return X[keep]
+
+
+class HighCardinalityDropper(BaseEstimator, TransformerMixin):
+    """Drop categorical columns whose cardinality ratio exceeds threshold."""
+
+    def __init__(self, threshold=0.5):
+        self.threshold = threshold
+        self.cols_to_drop_ = []
+
+    def fit(self, X, y=None):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        cat = X.select_dtypes(include=['object', 'category']).columns
+        n = max(len(X), 1)
+        self.cols_to_drop_ = [c for c in cat if X[c].nunique() / n > self.threshold]
+        return self
+
+    def transform(self, X):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        keep = [c for c in X.columns if c not in self.cols_to_drop_]
+        return X[keep]
+
+
+# ---------------------------------------------------------------------------
+# 2. Feature engineering transformers
+# ---------------------------------------------------------------------------
+
+class LoanFeatureEngineer(BaseEstimator, TransformerMixin):
+    """
+    Creative engineering for LendingClub:
+        - debt-to-income style ratios
+        - installment-to-income ratio
+        - average FICO
+        - credit history length (years between earliest_cr_line_year and issue_d_year)
+        - revolving utilization buckets
+        - log transforms on heavily skewed monetary columns
+    """
+
+    def __init__(self):
+        self.applied_log_cols_ = []
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+
+        # 1. installment-to-income (monthly)
+        if {'installment', 'annual_inc'}.issubset(X.columns):
+            monthly_inc = X['annual_inc'].replace(0, np.nan) / 12.0
+            X['installment_to_income'] = X['installment'] / monthly_inc
+
+        # 2. loan-to-income
+        if {'loan_amnt', 'annual_inc'}.issubset(X.columns):
+            X['loan_to_income'] = X['loan_amnt'] / X['annual_inc'].replace(0, np.nan)
+
+        # 3. average FICO
+        if {'fico_range_low', 'fico_range_high'}.issubset(X.columns):
+            X['fico_avg'] = (X['fico_range_low'] + X['fico_range_high']) / 2.0
+
+        # 4. credit history length (years)
+        if {'issue_d_year', 'earliest_cr_line_year'}.issubset(X.columns):
+            X['credit_history_yrs'] = X['issue_d_year'] - X['earliest_cr_line_year']
+
+        # 5. revolving utilization bucket (very low / low / med / high)
+        if 'revol_util' in X.columns:
+            X['revol_util_bucket'] = pd.cut(
+                X['revol_util'],
+                bins=[-0.1, 25, 50, 75, 200],
+                labels=['low', 'med', 'high', 'very_high']
+            ).astype(str)
+
+        # 6. log transforms on heavy-tailed monetary features
+        for col in ['annual_inc', 'loan_amnt', 'revol_bal']:
+            if col in X.columns and X[col].dropna().min() >= 0:
+                X['log_' + col] = np.log1p(X[col])
+
+        return X
+
+
 class AutoPowerTransformer(BaseEstimator, TransformerMixin):
+    """
+    Apply Yeo-Johnson power transform automatically to numeric columns whose
+    absolute skewness exceeds the threshold.
+    """
+
     def __init__(self, threshold=0.75):
         self.threshold = threshold
         self.skewed_cols = []
         self.pt = PowerTransformer(method='yeo-johnson')
 
     def fit(self, X, y=None):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        
-        # PROTECTION: Only look at columns that are actually numeric
-        # This prevents the step from ever seeing a categorical string
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
         numeric_df = X.select_dtypes(include=[np.number])
-        
         if numeric_df.empty:
             return self
-
-        # Only calculate skewness for numeric columns
-        skewness = numeric_df.apply(lambda x: skew(x.dropna()))
+        skewness = numeric_df.apply(lambda x: skew(x.dropna()) if x.dropna().size else 0.0)
         self.skewed_cols = skewness[abs(skewness) > self.threshold].index.tolist()
-        
         if self.skewed_cols:
-            self.pt.fit(X[self.skewed_cols])
+            self.pt.fit(X[self.skewed_cols].fillna(0))
         return self
 
     def transform(self, X):
-        X_copy = X.copy()
-        if not isinstance(X_copy, pd.DataFrame):
-            X_copy = pd.DataFrame(X_copy)
-            
+        X = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
         if self.skewed_cols:
-            X_copy[self.skewed_cols] = self.pt.transform(X_copy[self.skewed_cols])
-        return X_copy
-
+            existing = [c for c in self.skewed_cols if c in X.columns]
+            if existing:
+                X[existing] = self.pt.transform(X[existing].fillna(0))
+        return X
 
 
 class FeatureSelector(BaseEstimator, TransformerMixin):
-    def __init__(self, missing_threshold=0.3, corr_threshold=0.03, cardinality_threshold=0.9):
+    """
+    Final selection step:
+        - keep numeric columns whose absolute correlation with y is >= corr_threshold
+        - keep categorical columns whose cardinality ratio is reasonable
+    """
+
+    def __init__(self, missing_threshold=0.3, corr_threshold=0.02,
+                 cardinality_threshold=0.9):
         self.missing_threshold = missing_threshold
         self.corr_threshold = corr_threshold
-        self.cardinality_threshold = cardinality_threshold # Ratio of unique values to total rows
+        self.cardinality_threshold = cardinality_threshold
         self.features_to_keep = []
 
     def fit(self, X, y=None):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        
-        # 1. Missing Values Filter
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+
         null_ratios = X.isnull().mean()
         cols_low_missing = null_ratios[null_ratios <= self.missing_threshold].index.tolist()
         X_filtered = X[cols_low_missing]
 
-        # 2. High Cardinality Filter (Only for Categorical/Object columns)
         cat_cols = X_filtered.select_dtypes(exclude='number').columns
         cols_to_drop = []
-        
         for col in cat_cols:
-            uniqueness_ratio = X_filtered[col].nunique() / len(X_filtered)
+            uniqueness_ratio = X_filtered[col].nunique() / max(len(X_filtered), 1)
             if uniqueness_ratio > self.cardinality_threshold:
                 cols_to_drop.append(col)
-        
-        # Keep categoricals that are NOT high cardinality
         remaining_cats = [c for c in cat_cols if c not in cols_to_drop]
 
-        # 3. Correlation Filter (Only for Numeric columns)
         numeric_X = X_filtered.select_dtypes(include='number')
         if y is not None and not numeric_X.empty:
             temp_df = numeric_X.copy()
-            temp_df['target'] = y
+            temp_df['target'] = np.asarray(y)
             correlations = temp_df.corr()['target'].abs().drop('target')
             numeric_to_keep = correlations[correlations >= self.corr_threshold].index.tolist()
         else:
@@ -83,134 +277,6 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        return X[self.features_to_keep]
-
-class FeatureEngineer(BaseEstimator, TransformerMixin):
-    
-    def __init__(self, windows=[5, 10, 20]):
-        """
-        Initialize with a list of windows. 
-        Example: FeatureEngineer(windows=[5, 14, 30])
-        """
-        self.windows = windows
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        # Handle input types
-        if isinstance(X, np.ndarray):
-            X_df = pd.DataFrame(X)
-        else:
-            X_df = X.copy()
-
-        # Ensure we are working with a Series for rolling/diff operations
-        # squeeze() is used if X_df is a single-column DataFrame
-        data = X_df.squeeze()
-        X_out = pd.DataFrame(index=X_df.index)
-        
-        # Iterate through each window to create multi-scale features
-        for w in self.windows:
-            
-            # 1. Exponential Moving Average
-            X_out[f'EMA_{w}'] = data.ewm(span=w, min_periods=w).mean()
-
-            # 2. Rate of Change
-            M = data.diff(w - 1)
-            N = data.shift(w - 1)
-            X_out[f'ROC_{w}'] = (M / N) * 100
-
-            # 3. Price Momentum
-            X_out[f'MOM_{w}'] = data.diff(w)
-
-            # 4. Relative Strength Index (RSI)
-            delta = data.diff()
-            u = pd.Series(np.where(delta > 0, delta, 0), index=delta.index)
-            d = pd.Series(np.where(delta < 0, -delta, 0), index=delta.index)
-            avg_gain = u.ewm(com=w - 1, adjust=False).mean()
-            avg_loss = d.ewm(com=w - 1, adjust=False).mean()
-            rs = avg_gain / avg_loss
-            X_out[f'RSI_{w}'] = 100 - (100 / (1 + rs))
-            
-            # 5. Simple Moving Average
-            X_out[f'MA_{w}'] = data.rolling(w, min_periods=w).mean()
-
-        return X_out
-
-class PairFeatureEngineer(BaseEstimator, TransformerMixin):
-    def __init__(self, window=60):
-        self.window = window
-        # Internal state
-        self.last_beta_ = None
-        self.last_alpha_ = None
-        self.is_fitted_ = False
-
-    def fit(self, X, y=None):
-        """
-        Validates that the input data is sufficient for the window size.
-        In scikit-learn, fit must always return self.
-        """
-        if len(X) < self.window:
-            raise ValueError(f"Data length {len(X)} is less than window size {self.window}")
-        
-        self.is_fitted_ = True
-        return self
-
-    def transform(self, X):
-        """
-        X: Expected to be a DataFrame or Array with 2 columns: [Price_A, Price_B]
-        """
-        if not self.is_fitted_:
-            raise RuntimeError("Extractor must be fitted before calling transform.")
-
-        # Convert to DataFrame if input is a numpy array
-        if isinstance(X, np.ndarray):
-            df = pd.DataFrame(X, columns=['price_a', 'price_b'])
-        else:
-            df = X.copy()
-            df.columns = ['price_a', 'price_b']
-        
-        # 1. Compute Rolling Spread and Beta
-        df[['spread', 'beta']] = self._compute_rolling_regression(df)
-
-        # 2. Derive Statistics-based Features
-        df['z_score'] = self._calculate_z_score(df['spread'])
-        df['spread_std'] = df['spread'].rolling(self.window).std()
-        df['beta_stability'] = df['beta'].rolling(self.window).std()
-
-        
-        return df#.dropna()
-
-    def _compute_rolling_regression(self, df):
-        spreads = np.full(len(df), np.nan)
-        betas = np.full(len(df), np.nan)
-        
-        a_vals = df['price_a'].values
-        b_vals = df['price_b'].values
-
-        for i in range(self.window, len(df)):
-            y = a_vals[i-self.window:i]
-            x = b_vals[i-self.window:i]
-            x_with_const = sm.add_constant(x)
-            
-            model = sm.OLS(y, x_with_const).fit()
-            
-            alpha, beta = model.params[0], model.params[1]
-            betas[i] = beta
-            spreads[i] = a_vals[i] - (beta * b_vals[i] + alpha)
-            
-            # Update state for live prediction tracking
-            self.last_alpha_, self.last_beta_ = alpha, beta
-            
-        return pd.DataFrame({'spread': spreads, 'beta': betas}, index=df.index)
-
-    def _calculate_z_score(self, spread_series):
-        rolling_mean = spread_series.rolling(self.window).mean()
-        rolling_std = spread_series.rolling(self.window).std()
-        return (spread_series - rolling_mean) / rolling_std
-
-# --- Usage Example ---
-# extractor = PairFeatureExtractor(window=60)
-# features_df = extractor.transform(data['AAPL'], data['MSFT'])
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        keep = [c for c in self.features_to_keep if c in X.columns]
+        return X[keep]
