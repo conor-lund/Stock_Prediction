@@ -67,8 +67,8 @@ if local_src not in sys.path:
 #from src.Custom_Classes import LoanColumnCleaner, LoanFeatureEngineer
 
 # Reference training frame used to construct a complete row to send to the
-# endpoint.  The notebook writes this file to ./Project/X_train.csv.
-file_path = os.path.join(project_root, 'Project/X_train.csv')
+# endpoint.  X_train.csv sits next to this script inside Portfolio/.
+file_path = os.path.join(current_dir, 'X_train.csv')
 
 dataset = pd.read_csv(file_path)
 dataset = dataset.drop(['Unnamed: 0'], axis=1)
