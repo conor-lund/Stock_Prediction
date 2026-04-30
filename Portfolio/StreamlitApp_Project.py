@@ -241,7 +241,12 @@ with st.form("pred_form"):
 # Build a complete row by starting from dataset.iloc[0] and overwriting only the
 # user-controlled fields.  This keeps the pipeline happy (it expects the full
 # schema it was trained on).
-original = dataset.iloc[0:1].to_dict()
+#
+# IMPORTANT: use orient='list' so every value is a list (single-element).  If we
+# leave the default orient (dict-of-dict for dataset columns) and then update with
+# user inputs as lists, pandas barfs with
+#     "Mixing dicts with non-Series may lead to ambiguous ordering."
+original = dataset.iloc[0:1].to_dict(orient='list')
 original.update({k: [v] for k, v in user_inputs.items()})
 
 if submitted:
